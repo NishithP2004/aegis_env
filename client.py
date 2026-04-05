@@ -38,6 +38,11 @@ class AegisEnv(
 
     def _parse_result(self, payload: Dict[str, Any]) -> StepResult[AegisObservation]:
         obs_data = payload.get("observation", {})
+        metadata: Dict[str, Any] = dict(obs_data.get("metadata") or {})
+        for key in ("last_action_error", "error"):
+            if key in payload and payload[key] is not None:
+                metadata[key] = payload[key]
+
         observation = AegisObservation(
             question=obs_data.get("question", ""),
             rubric=obs_data.get("rubric", ""),
@@ -46,7 +51,7 @@ class AegisEnv(
             grading_info=obs_data.get("grading_info") or {},
             done=payload.get("done", False),
             reward=payload.get("reward"),
-            metadata=obs_data.get("metadata", {}),
+            metadata=metadata,
         )
 
         return StepResult(

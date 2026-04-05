@@ -6,56 +6,138 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Baseline inference loop: OpenAI-compatible LLM API + AEGIS-Env (WebSocket client or local env).
+Hackathon inference script for AEGIS-Env.
 
-Required environment variables:
-  HF_TOKEN — Hugging Face API token (mandatory).
+MANDATORY / configurable environment variables:
+  API_BASE_URL     LLM API endpoint (default set below).
+  MODEL_NAME       Model id for chat completions (default set below).
+  HF_TOKEN         Hugging Face / API key for the OpenAI client.
+  LOCAL_IMAGE_NAME or IMAGE_NAME
+                   If set, the environment client is created with from_docker_image().
+  OPENENV_BASE_URL Used when neither --local nor a Docker image is set.
 
-Environment variables with defaults:
-  API_BASE_URL — LLM API base URL (default: Hugging Face OpenAI-compatible router).
-  MODEL_NAME — Model identifier for chat completions.
-
-Logging format (hackathon):
+Stdout (exact line shapes):
   [START] task=<task_name> env=<benchmark> model=<model_name>
-  [STEP] step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
-  [END] success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
+  [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+  [END]   success=<true|false> steps=<n> score=<0.00> rewards=<r1,r2,...>
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
 import traceback
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from openai import OpenAI
+from openenv.core.client_types import StepResult
 
 from models import AegisAction, AegisObservation
 
-# Defaults when API_BASE_URL / MODEL_NAME are unset (Hugging Face Inference + router).
-_DEFAULT_API_BASE_URL = "https://router.huggingface.co/v1"
-_DEFAULT_MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
+# --- Defaults (API_BASE_URL / MODEL_NAME only; HF_TOKEN has no default) ---
+_DEFAULT_API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+_DEFAULT_MODEL_NAME = os.getenv("MODEL_NAME") or "meta-llama/Llama-3.2-3B-Instruct"
+
+API_BASE_URL = _DEFAULT_API_BASE_URL
+MODEL_NAME = _DEFAULT_MODEL_NAME
+
+IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME") or os.getenv("IMAGE_NAME") or ""
+TASK_NAME = os.getenv("TASK_NAME") or os.getenv("AEGIS_TASK") or "grading"
+BENCHMARK = os.getenv("BENCHMARK") or os.getenv("AEGIS_BENCHMARK") or "AEGIS-Env"
+MAX_STEPS = int(os.getenv("MAX_STEPS", "1"))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "4096"))
+SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.1"))
 
 
-def _llm_api_base_url() -> str:
-    return os.environ.get("API_BASE_URL", _DEFAULT_API_BASE_URL)
+def _llm_api_base_url(cli_override: Optional[str]) -> str:
+    if cli_override is not None:
+        return cli_override
+    return os.getenv("API_BASE_URL") or API_BASE_URL
 
 
-def _model_name() -> str:
-    return os.environ.get("MODEL_NAME", _DEFAULT_MODEL_NAME)
+def _model_name(cli_override: Optional[str]) -> str:
+    if cli_override is not None:
+        return cli_override
+    return os.getenv("MODEL_NAME") or MODEL_NAME
+
+
+def _docker_image_name(cli_override: Optional[str]) -> str:
+    if cli_override:
+        return cli_override
+    return (os.getenv("LOCAL_IMAGE_NAME") or os.getenv("IMAGE_NAME") or "").strip()
+
+
+def _done_str(done: bool) -> str:
+    return str(done).lower()
+
+
+def _episode_score(rewards: List[float]) -> float:
+    if not rewards:
+        return 0.0
+    s = sum(rewards) / len(rewards)
+    return min(1.0, max(0.0, s))
+
+
+def _one_line(s: str) -> str:
+    return s.replace("\n", " ").replace("\r", " ")
+
+
+def _last_action_error_from_result(sr: Optional[StepResult[AegisObservation]]) -> Optional[str]:
+    if sr is None:
+        return None
+    md = getattr(sr.observation, "metadata", None) or {}
+    return md.get("last_action_error") or md.get("error")
+
+
+def _error_column(parse_exc: Optional[str], sr: Optional[StepResult[AegisObservation]]) -> str:
+    if parse_exc is not None:
+        return _one_line(parse_exc)
+    lae = _last_action_error_from_result(sr)
+    if lae is not None and str(lae).strip() != "":
+        return _one_line(str(lae))
+    return "null"
 
 
 def _require_hf_token() -> str:
-    token = os.environ.get("HF_TOKEN")
+    token = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY")
     if token is None or not str(token).strip():
         print(
-            "HF_TOKEN is required (set your Hugging Face API token in the environment).",
+            "HF_TOKEN (or API_KEY) is required for the OpenAI client.",
             file=sys.stderr,
         )
         sys.exit(1)
     return str(token).strip()
+
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(
+    step: int,
+    action: str,
+    reward: float,
+    done: bool,
+    error_column: str,
+) -> None:
+    # Two spaces after [STEP] per hackathon format
+    print(
+        f"[STEP]  step={step} action={action} reward={reward:.2f} "
+        f"done={_done_str(done)} error={error_column}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
+        flush=True,
+    )
 
 
 def generate_grading_prompt(obs: AegisObservation) -> str:
@@ -114,16 +196,15 @@ def _action_log_str(action: AegisAction) -> str:
     )
 
 
-def _complete_grading(
-    llm: OpenAI,
-    model: str,
-    prompt: str,
-) -> str:
-    completion = llm.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
+def _complete_grading(llm: OpenAI, model: str, prompt: str) -> str:
+    kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": TEMPERATURE,
+    }
+    if MAX_TOKENS > 0:
+        kwargs["max_tokens"] = MAX_TOKENS
+    completion = llm.chat.completions.create(**kwargs)
     return (completion.choices[0].message.content or "").strip()
 
 
@@ -139,76 +220,22 @@ def run_local_episode(
     benchmark: str,
     model: str,
     llm: OpenAI,
-) -> tuple[bool, int, List[float]]:
-    """Run one episode using in-process ``AegisEnvironment`` (no HTTP server)."""
+) -> Tuple[bool, int, List[float]]:
+    """In-process environment (sync)."""
     from server.aegis_env_environment import AegisEnvironment
 
     rewards: List[float] = []
-    steps = 0
-
-    print(f"[START] task={task_name} env={benchmark} model={model}", flush=True)
+    steps_taken = 0
+    log_start(task_name, benchmark, model)
 
     env = AegisEnvironment()
+    obs: AegisObservation
     try:
         obs = env.reset(seed=_episode_seed())
-        prompt = generate_grading_prompt(obs)
-        text = _strip_markdown_json_fence(_complete_grading(llm, model, prompt))
+        for step in range(1, MAX_STEPS + 1):
+            if obs.done and steps_taken > 0:
+                break
 
-        try:
-            action = _parse_action(text, obs.max_score)
-        except Exception as e:
-            err = f"parse_error: {e!s}"
-            print(
-                f"[STEP] step={steps + 1} action={text[:300]!r} reward={0.0:.2f} "
-                f"done={True} error={err}",
-                flush=True,
-            )
-            rewards.append(0.0)
-            return False, steps + 1, rewards
-
-        steps += 1
-        out = env.step(action)
-        r = float(out.reward or 0.0)
-        rewards.append(r)
-        print(
-            f"[STEP] step={steps} action={_action_log_str(action)!r} reward={r:.2f} "
-            f"done={out.done} error=null",
-            flush=True,
-        )
-        return True, steps, rewards
-    except Exception as e:
-        err = f"{type(e).__name__}: {e!s}"
-        print(
-            f"[STEP] step={steps + 1} action=<none> reward={0.0:.2f} done={True} error={err}",
-            flush=True,
-        )
-        traceback.print_exc()
-        rewards.append(0.0)
-        return False, steps + 1, rewards
-    finally:
-        env.close()
-
-
-def run_client_episode(
-    task_name: str,
-    benchmark: str,
-    model: str,
-    openenv_base_url: str,
-    llm: OpenAI,
-) -> tuple[bool, int, List[float]]:
-    """Run one episode via OpenEnv WebSocket client (server must be running)."""
-    from client import AegisEnv
-
-    rewards: List[float] = []
-    steps = 0
-
-    print(f"[START] task={task_name} env={benchmark} model={model}", flush=True)
-
-    sync = AegisEnv(base_url=openenv_base_url).sync()
-    try:
-        with sync:
-            r0 = sync.reset(seed=_episode_seed())
-            obs = r0.observation
             prompt = generate_grading_prompt(obs)
             text = _strip_markdown_json_fence(_complete_grading(llm, model, prompt))
 
@@ -216,86 +243,194 @@ def run_client_episode(
                 action = _parse_action(text, obs.max_score)
             except Exception as e:
                 err = f"parse_error: {e!s}"
-                print(
-                    f"[STEP] step={steps + 1} action={text[:300]!r} reward={0.0:.2f} "
-                    f"done={True} error={err}",
-                    flush=True,
-                )
+                steps_taken = step
                 rewards.append(0.0)
-                return False, steps + 1, rewards
+                log_step(step, repr(text[:300]), 0.0, True, _error_column(err, None))
+                return False, steps_taken, rewards
 
-            steps += 1
-            r1 = sync.step(action)
-            r = float(r1.reward or 0.0)
+            out = env.step(action)
+            r = float(getattr(out, "reward", None) or 0.0)
             rewards.append(r)
-            print(
-                f"[STEP] step={steps} action={_action_log_str(action)!r} reward={r:.2f} "
-                f"done={r1.done} error=null",
-                flush=True,
+            steps_taken = step
+            log_step(
+                step,
+                repr(_action_log_str(action)),
+                r,
+                bool(getattr(out, "done", False)),
+                _error_column(None, None),
             )
-            return True, steps, rewards
+            obs = out
+            if getattr(out, "done", False):
+                break
+
+        return True, steps_taken, rewards
     except Exception as e:
-        success = False
         err = f"{type(e).__name__}: {e!s}"
-        print(
-            f"[STEP] step={steps + 1} action=<none> reward={0.0:.2f} done={True} error={err}",
-            flush=True,
-        )
+        steps_taken = max(steps_taken, 1)
+        rewards.append(0.0)
+        log_step(steps_taken, "<none>", 0.0, True, _error_column(err, None))
         traceback.print_exc()
+        return False, steps_taken, rewards
+    finally:
+        env.close()
+
+
+async def run_remote_episode_async(
+    task_name: str,
+    benchmark: str,
+    model: str,
+    llm: OpenAI,
+    openenv_base_url: str,
+    docker_image: str,
+) -> Tuple[bool, int, List[float]]:
+    """WebSocket client: optional Docker image or HTTP base URL."""
+    from client import AegisEnv
+
+    rewards: List[float] = []
+    steps_taken = 0
+    log_start(task_name, benchmark, model)
+
+    env: Optional["AegisEnv"] = None
+    try:
+        if docker_image:
+            env = await AegisEnv.from_docker_image(docker_image)
+        else:
+            env = AegisEnv(base_url=openenv_base_url)
+            await env.connect()
+
+        result = await env.reset(seed=_episode_seed())
+
+        for step in range(1, MAX_STEPS + 1):
+            if result.done and steps_taken > 0:
+                break
+
+            obs = result.observation
+            prompt = generate_grading_prompt(obs)
+            text = _strip_markdown_json_fence(_complete_grading(llm, model, prompt))
+
+            try:
+                action = _parse_action(text, obs.max_score)
+            except Exception as e:
+                err = f"parse_error: {e!s}"
+                steps_taken = step
+                rewards.append(0.0)
+                log_step(step, repr(text[:300]), 0.0, True, _error_column(err, None))
+                return False, steps_taken, rewards
+
+            result = await env.step(action)
+            r = float(result.reward or 0.0)
+            rewards.append(r)
+            steps_taken = step
+            log_step(
+                step,
+                repr(_action_log_str(action)),
+                r,
+                result.done,
+                _error_column(None, result),
+            )
+            if result.done:
+                break
+
+        return True, steps_taken, rewards
+    except Exception as e:
+        err = f"{type(e).__name__}: {e!s}"
+        steps_taken = max(steps_taken, 1)
         if not rewards:
             rewards.append(0.0)
-        return success, max(steps, 1), rewards
+        log_step(steps_taken, "<none>", 0.0, True, _error_column(err, None))
+        traceback.print_exc()
+        return False, steps_taken, rewards
+    finally:
+        if env is not None:
+            await env.close()
+
+
+async def run_episode_async(
+    args: argparse.Namespace,
+    model: str,
+    llm: OpenAI,
+) -> Tuple[bool, int, List[float]]:
+    docker_image = _docker_image_name(getattr(args, "docker_image", None) or None)
+    if args.local:
+        return await asyncio.to_thread(
+            run_local_episode,
+            args.task_name,
+            args.benchmark,
+            model,
+            llm,
+        )
+    return await run_remote_episode_async(
+        args.task_name,
+        args.benchmark,
+        model,
+        llm,
+        args.openenv_base_url,
+        docker_image,
+    )
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="AEGIS-Env baseline inference (OpenAI-compatible LLM + HF_TOKEN)",
-    )
-    p.add_argument("--task-name", default="grading", help="Logged task name")
-    p.add_argument("--benchmark", default="AEGIS-Env", help="Logged benchmark / env name")
-    p.add_argument(
-        "--model",
-        default=None,
-        help=f"Override MODEL_NAME (default from env or {_DEFAULT_MODEL_NAME!r})",
+        description="AEGIS-Env inference (OpenAI client + async OpenEnv)",
     )
     p.add_argument(
-        "--api-base-url",
-        default=None,
-        dest="api_base_url",
-        help=f"Override API_BASE_URL (default from env or {_DEFAULT_API_BASE_URL!r})",
+        "--task-name",
+        default=TASK_NAME,
+        help="Logged task (env TASK_NAME / AEGIS_TASK)",
     )
+    p.add_argument(
+        "--benchmark",
+        default=BENCHMARK,
+        help="Logged benchmark (env BENCHMARK / AEGIS_BENCHMARK)",
+    )
+    p.add_argument("--model", default=None, help="Override MODEL_NAME")
+    p.add_argument("--api-base-url", default=None, dest="api_base_url")
     p.add_argument(
         "--openenv-base-url",
         default=os.environ.get("OPENENV_BASE_URL", "http://127.0.0.1:8000"),
-        help="OpenEnv server URL (ignored with --local)",
+    )
+    p.add_argument(
+        "--docker-image",
+        default=None,
+        help="Override LOCAL_IMAGE_NAME / IMAGE_NAME for from_docker_image()",
     )
     p.add_argument(
         "--local",
         action="store_true",
-        help="Use in-process AegisEnvironment (requires MONGO_URI); no server",
+        help="In-process environment (MONGO_URI); no HTTP/Docker client",
     )
     args = p.parse_args(argv)
 
-    hf_token = _require_hf_token()
-    api_base = args.api_base_url if args.api_base_url is not None else _llm_api_base_url()
-    model = args.model if args.model is not None else _model_name()
+    success = False
+    steps_out = 0
+    rewards_out: List[float] = []
+    exit_code = 1
 
-    llm = OpenAI(base_url=api_base, api_key=hf_token)
+    try:
+        hf_token = _require_hf_token()
+        api_base = _llm_api_base_url(args.api_base_url)
+        model = _model_name(args.model)
+        llm = OpenAI(base_url=api_base, api_key=hf_token)
 
-    if args.local:
-        ok, n, rewards = run_local_episode(args.task_name, args.benchmark, model, llm)
-    else:
-        ok, n, rewards = run_client_episode(
-            args.task_name,
-            args.benchmark,
-            model,
-            args.openenv_base_url,
-            llm,
+        _, steps_out, rewards_out = asyncio.run(run_episode_async(args, model, llm))
+        score = _episode_score(rewards_out)
+        success = score >= SUCCESS_SCORE_THRESHOLD
+        exit_code = 0 if success else 1
+    except SystemExit:
+        raise
+    except Exception:
+        traceback.print_exc()
+        success = False
+        exit_code = 1
+    finally:
+        log_end(
+            success,
+            steps_out,
+            _episode_score(rewards_out),
+            rewards_out,
         )
 
-    rlist = ",".join(f"{x:.4f}" for x in rewards)
-    print(f"[END] success={str(ok).lower()} steps={n} rewards={rlist}", flush=True)
-    return 0 if ok else 1
+    return exit_code
 
 
 if __name__ == "__main__":

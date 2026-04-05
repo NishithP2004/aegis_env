@@ -1,6 +1,6 @@
 ---
 title: Aegis Env Environment Server
-emoji: 🔕
+emoji: 🎓
 colorFrom: indigo
 colorTo: gray
 sdk: docker
