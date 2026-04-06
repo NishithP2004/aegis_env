@@ -66,6 +66,7 @@ class AegisEnvironment(Environment[AegisAction, AegisObservation, State]):
         self._current_record: Optional[Dict[str, Any]] = None
         self.current_ground_truth: Optional[float] = None
         self.current_reference_feedback: str = ""
+        self.current_max_score: float = 1.0
 
         uri = os.environ.get("MONGO_URI")
         if not uri:
@@ -79,6 +80,7 @@ class AegisEnvironment(Environment[AegisAction, AegisObservation, State]):
             try:
                 coll = client["AEGIS"]["AEGIS-Eval-v2"]
                 projection = {
+                    "dataset": 1,
                     "question": 1,
                     "rubrics": 1,
                     "student_response": 1,
@@ -101,34 +103,57 @@ class AegisEnvironment(Environment[AegisAction, AegisObservation, State]):
         episode_id: Optional[str] = None,
         **kwargs: Any,
     ) -> AegisObservation:
-        if seed is not None:
-            self._rng.seed(seed)
+        # OpenEnv passes the task via environment variable (or via reset kwargs in some harnesses).
+        # Default to 'easy'.
+        task_name = str(kwargs.get("task_name") or os.getenv("TASK_NAME", "easy"))
 
-        self._state = State(
-            episode_id=episode_id or str(uuid4()),
-            step_count=0,
-        )
+        # Map the task ID to the corresponding dataset label
+        task_mapping = {
+            "easy": "mohler",
+            "medium": "asap-sas",
+            "hard": "ricechem",
+        }
+
+        target_dataset = task_mapping.get(task_name, "mohler")
 
         if not self.dataset:
             msg = self._load_error or "No grading records loaded."
             raise RuntimeError(msg)
 
-        self._current_record = self._rng.choice(self.dataset)
-        assert self._current_record is not None
+        # Filter the in-memory dataset loaded during __init__
+        available_records = [r for r in self.dataset if r.get("dataset") == target_dataset]
 
-        ms = float(self._current_record.get("max_score") or 0.0)
-        if ms <= 0.0:
-            raise RuntimeError("Sampled record has invalid max_score; cannot build observation.")
+        # Fallback if the dataset filter yields an empty list
+        if not available_records:
+            available_records = self.dataset
 
-        self.current_ground_truth = float(self._current_record.get("obtained_score", 0.0))
-        ref = self._current_record.get("reference_feedback")
-        self.current_reference_feedback = str(ref) if ref is not None else ""
+        # Sample a random question from the targeted difficulty tier
+        selected_record = random.choice(available_records)
+        self._current_record = selected_record
 
+        self._state = State(
+            episode_id=episode_id or str(uuid4()),
+            step_count=0,
+        )
+        if seed is not None:
+            self._rng.seed(seed)
+
+        # Store the ground truth for the deterministic reward calculation in step()
+        self.current_ground_truth = float(selected_record.get("obtained_score", 0.0))
+        self.current_reference_feedback = str(selected_record.get("reference_feedback", "") or "")
+        self.current_max_score = float(selected_record.get("max_score", 1.0) or 1.0)
+
+        # Ensure rubrics are handled even if missing (like in ASAP-SAS)
+        rubric_text = selected_record.get("rubrics", "")
+        if not rubric_text or str(rubric_text).lower() == "nan":
+            rubric_text = "Holistic grading: Evaluate the answer based on general scientific/linguistic accuracy."
+
+        # Return the Pydantic Observation model
         return AegisObservation(
-            question=str(self._current_record.get("question", "")),
-            rubric=_rubrics_to_str(self._current_record.get("rubrics")),
-            max_score=ms,
-            student_answer=str(self._current_record.get("student_response", "")),
+            question=selected_record.get("question", "") or "",
+            rubric=_rubrics_to_str(rubric_text),
+            max_score=self.current_max_score,
+            student_answer=selected_record.get("student_response", "") or "",
             done=False,
             reward=None,
             grading_info={},

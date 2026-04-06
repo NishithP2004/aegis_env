@@ -45,7 +45,7 @@ API_BASE_URL = _DEFAULT_API_BASE_URL
 MODEL_NAME = _DEFAULT_MODEL_NAME
 
 IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME") or os.getenv("IMAGE_NAME") or ""
-TASK_NAME = os.getenv("TASK_NAME") or os.getenv("AEGIS_TASK") or "grading"
+TASK_NAME = os.getenv("TASK_NAME", "easy")
 BENCHMARK = os.getenv("BENCHMARK") or os.getenv("AEGIS_BENCHMARK") or "AEGIS-Env"
 MAX_STEPS = int(os.getenv("MAX_STEPS", "1"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
@@ -231,7 +231,7 @@ def run_local_episode(
     env = AegisEnvironment()
     obs: AegisObservation
     try:
-        obs = env.reset(seed=_episode_seed())
+        obs = env.reset(seed=_episode_seed(), task_name=task_name)
         for step in range(1, MAX_STEPS + 1):
             if obs.done and steps_taken > 0:
                 break
@@ -293,12 +293,16 @@ async def run_remote_episode_async(
     env: Optional["AegisEnv"] = None
     try:
         if docker_image:
-            env = await AegisEnv.from_docker_image(docker_image)
+            # Ensure the container sees the selected task.
+            env = await AegisEnv.from_docker_image(
+                docker_image,
+                env_vars={"TASK_NAME": task_name},
+            )
         else:
             env = AegisEnv(base_url=openenv_base_url)
             await env.connect()
 
-        result = await env.reset(seed=_episode_seed())
+        result = await env.reset(seed=_episode_seed(), task_name=task_name)
 
         for step in range(1, MAX_STEPS + 1):
             if result.done and steps_taken > 0:

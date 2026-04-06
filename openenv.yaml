@@ -8,3 +8,10 @@ type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
+tasks:
+  - id: easy
+    description: "Evaluate short-answer questions (average 68 tokens). Focuses on straightforward factual extraction and keyword presence. Derived from the Mohler dataset."
+  - id: medium
+    description: "Evaluate paragraph-length conceptual answers (average 598 tokens). Requires long-context semantic understanding and holistic grading. Derived from the ASAP-SAS dataset."
+  - id: hard
+    description: "Evaluate complex, domain-specific logic (Chemistry). Tests the frontier model's deep technical reasoning and strict rubric adherence against high failure rates. Derived from the RiceChem dataset."
