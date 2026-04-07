@@ -7,13 +7,16 @@
 """
 AEGIS-Env: automated grading simulation with deterministic rewards.
 
-MongoDB is queried only in ``__init__``; ``reset`` and ``step`` are CPU-only.
+The dataset is downloaded from Hugging Face and cached on disk; ``reset`` and
+``step`` are CPU-only.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import random
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -46,6 +49,145 @@ def _jaccard(a_text: str, b_text: str) -> float:
     return float(inter) / float(union) if union else 0.0
 
 
+def _load_dotenv_if_available() -> None:
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(override=True)
+    except Exception:
+        pass
+
+
+def _cache_dir() -> Path:
+    # Default to a repo-local cache so it works in sandboxed runners.
+    # You can override via AEGIS_CACHE_DIR / HF_HOME / XDG_CACHE_HOME.
+    root = (
+        os.environ.get("AEGIS_CACHE_DIR")
+        or os.environ.get("HF_HOME")
+        or os.environ.get("XDG_CACHE_HOME")
+    )
+    if root:
+        return Path(root) / "aegis_env"
+    repo_root = Path(__file__).resolve().parents[1]
+    return repo_root / ".cache" / "aegis_env"
+
+
+def _unwrap_object_id(v: Any) -> str:
+    # Expected schema: {"$oid": "..."}; tolerate already-string ids.
+    if isinstance(v, dict) and "$oid" in v:
+        return str(v.get("$oid") or "")
+    return str(v or "")
+
+
+def _unwrap_number(v: Any) -> Optional[float]:
+    # Expected schema: number OR {"$numberDouble": "Infinity"/"-Infinity"/"NaN"}.
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, dict) and "$numberDouble" in v:
+        s = str(v.get("$numberDouble"))
+        if s == "Infinity":
+            return float("inf")
+        if s == "-Infinity":
+            return float("-inf")
+        if s == "NaN":
+            return float("nan")
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _reference_feedback_from_record(rec: Dict[str, Any]) -> str:
+    # New schema stores feedback under evaluation.agent_feedback.
+    ev = rec.get("evaluation") or {}
+    agent_feedback = (ev.get("agent_feedback") or {}) if isinstance(ev, dict) else {}
+    if isinstance(agent_feedback, dict):
+        sj = agent_feedback.get("score_justification")
+        ia = agent_feedback.get("improvement_advice")
+        joined = " ".join([str(x).strip() for x in [sj, ia] if x is not None]).strip()
+        if joined:
+            return joined
+    # Backward-compat: old field name.
+    return str(rec.get("reference_feedback") or "")
+
+
+def _download_dataset_json(repo_id: str, filename: str, revision: Optional[str]) -> Path:
+    from huggingface_hub import hf_hub_download  # type: ignore[import-not-found]
+
+    cache_dir = _cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        downloaded = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="dataset",
+            revision=revision,
+            cache_dir=str(cache_dir / "hf"),
+        )
+    except Exception:
+        # In some sandboxed environments, network access to Hugging Face may be blocked.
+        # If the file is already present in the global HF cache, fall back to it.
+        downloaded = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="dataset",
+            revision=revision,
+            cache_dir=None,
+            local_files_only=True,
+        )
+    stable_path = cache_dir / f"{repo_id.replace('/', '__')}__{filename}"
+    try:
+        stable_path.write_bytes(Path(downloaded).read_bytes())
+        return stable_path
+    except Exception:
+        return Path(downloaded)
+
+
+def _load_dataset_records() -> List[Dict[str, Any]]:
+    _load_dotenv_if_available()
+
+    repo_id = os.environ.get("AEGIS_HF_DATASET_REPO") or "NishithP2004/AEGIS-Eval-v2"
+    filename = os.environ.get("AEGIS_HF_DATASET_FILE") or "dataset.json"
+    revision = os.environ.get("AEGIS_HF_DATASET_REVISION") or None
+    offline = str(os.environ.get("AEGIS_HF_OFFLINE") or "").lower() in {"1", "true", "yes"}
+
+    cache_dir = _cache_dir()
+    stable_path = cache_dir / f"{repo_id.replace('/', '__')}__{filename}"
+
+    path: Optional[Path] = None
+    if stable_path.exists():
+        path = stable_path
+    elif not offline:
+        path = _download_dataset_json(repo_id, filename, revision)
+
+    if path is None or not path.exists():
+        raise RuntimeError(
+            f"Dataset cache not found. Expected {stable_path}. "
+            f"Set AEGIS_HF_OFFLINE=0 to allow download or provide the cached file."
+        )
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        records = data["data"]
+    elif isinstance(data, list):
+        records = data
+    else:
+        raise RuntimeError(f"Unexpected dataset.json shape in {path}")
+
+    out: List[Dict[str, Any]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        norm: Dict[str, Any] = dict(rec)
+        norm["_id"] = _unwrap_object_id(rec.get("_id"))
+        for k in ("max_score", "min_score", "obtained_score"):
+            norm[k] = _unwrap_number(rec.get(k))
+        out.append(norm)
+    return out
+
+
 class AegisEnvironment(Environment[AegisAction, AegisObservation, State]):
     """
     Single-step grading episode: reset samples a row; step scores the agent output.
@@ -68,33 +210,10 @@ class AegisEnvironment(Environment[AegisAction, AegisObservation, State]):
         self.current_reference_feedback: str = ""
         self.current_max_score: float = 1.0
 
-        uri = os.environ.get("MONGO_URI")
-        if not uri:
-            self._load_error = "MONGO_URI is not set; dataset is empty."
-            return
-
         try:
-            from pymongo import MongoClient  # type: ignore[import-untyped]
-
-            client = MongoClient(uri, serverSelectionTimeoutMS=10_000)
-            try:
-                coll = client["AEGIS"]["AEGIS-Eval-v2"]
-                projection = {
-                    "dataset": 1,
-                    "question": 1,
-                    "rubrics": 1,
-                    "student_response": 1,
-                    "max_score": 1,
-                    "obtained_score": 1,
-                    "reference_feedback": 1,
-                }
-                cursor = coll.find({}, projection)
-                for doc in cursor:
-                    self.dataset.append(doc)
-            finally:
-                client.close()
+            self.dataset = _load_dataset_records()
         except Exception as e:
-            self._load_error = f"MongoDB load failed: {e!s}"
+            self._load_error = f"Dataset load failed: {e!s}"
             self.dataset = []
 
     def reset(
@@ -140,7 +259,7 @@ class AegisEnvironment(Environment[AegisAction, AegisObservation, State]):
 
         # Store the ground truth for the deterministic reward calculation in step()
         self.current_ground_truth = float(selected_record.get("obtained_score", 0.0))
-        self.current_reference_feedback = str(selected_record.get("reference_feedback", "") or "")
+        self.current_reference_feedback = _reference_feedback_from_record(selected_record)
         self.current_max_score = float(selected_record.get("max_score", 1.0) or 1.0)
 
         # Ensure rubrics are handled even if missing (like in ASAP-SAS)

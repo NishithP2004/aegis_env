@@ -18,8 +18,10 @@ dependencies = [
     # install from github
     # "openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git",
     "openenv-core[core]>=0.2.2",
-    "pymongo>=4.6.0",
     "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "huggingface-hub>=0.23.0",
+    "datasets>=2.19.0",
     # Environment-specific dependencies
     # Add all dependencies needed for your environment here
     # Examples:
