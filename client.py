@@ -12,7 +12,10 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import AegisAction, AegisObservation
+try:
+    from .models import AegisAction, AegisObservation
+except ImportError:
+    from models import AegisAction, AegisObservation
 
 
 class AegisEnv(
