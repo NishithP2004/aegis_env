@@ -603,6 +603,11 @@ async def main_async(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--success-score-threshold", type=float, default=SUCCESS_SCORE_THRESHOLD)
     p.add_argument("--episode-seed", type=int, default=None)
     p.add_argument(
+        "--single-task",
+        action="store_true",
+        help="Run only the selected --task-name (disable default easy/medium/hard sweep).",
+    )
+    p.add_argument(
         "--docker-image",
         default=None,
         help="Override LOCAL_IMAGE_NAME for from_docker_image()",
@@ -625,27 +630,56 @@ async def main_async(argv: Optional[List[str]] = None) -> int:
         model = _model_name(args.model)
         llm = OpenAI(base_url=api_base, api_key=api_key or "no-key")
         llm._aegis_llm_enabled = bool(api_key)  # type: ignore[attr-defined]
+        # By default, run one example for each task tier to satisfy validators that
+        # require multiple tasks with graders.
+        tasks = [args.task_name] if args.single_task else ["easy", "medium", "hard"]
 
-        _, steps_out, rewards_out = await run_episode_async(args, model, llm)
-        score = _episode_score(rewards_out)
-        success = score >= float(args.success_score_threshold)
-        exit_code = 0 if success else 1
+        # Each task is its own episode block with its own START/STEP/END lines.
+        overall_success = True
+        overall_exit_code = 0
+        for t in tasks:
+            per_steps = 0
+            per_rewards: List[float] = []
+            per_success = False
+            try:
+                args.task_name = t
+                _, per_steps, per_rewards = await run_episode_async(args, model, llm)
+                per_score = _episode_score(per_rewards)
+                per_success = per_score >= float(args.success_score_threshold)
+            except Exception as e:
+                # Ensure we always emit END even on errors.
+                print(f"fatal_error={type(e).__name__}: {e!s}", file=sys.stderr)
+                per_steps = max(per_steps, 1)
+                if not per_rewards:
+                    per_rewards = [0.0]
+                per_success = False
+                per_score = _episode_score(per_rewards)
+            finally:
+                log_end(
+                    per_success,
+                    per_steps,
+                    _episode_score(per_rewards),
+                    per_rewards,
+                )
+
+            overall_success = overall_success and per_success
+            overall_exit_code = 0 if overall_success else 1
+
+        # Populate legacy outputs for completeness (not used for logging now).
+        success = overall_success
+        exit_code = overall_exit_code
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        success = _episode_score(rewards_out) >= float(args.success_score_threshold)
+        success = False
         exit_code = 130
     except Exception as e:
         print(f"fatal_error={type(e).__name__}: {e!s}", file=sys.stderr)
         success = False
         exit_code = 1
     finally:
-        log_end(
-            success,
-            steps_out,
-            _episode_score(rewards_out),
-            rewards_out,
-        )
+        # END lines are emitted per-task above; nothing to do here.
+        pass
 
     return exit_code
 
