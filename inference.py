@@ -26,10 +26,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
-import traceback
 from typing import List, Optional, Tuple
 
 from openai import OpenAI
@@ -201,7 +201,29 @@ def _episode_seed(args: argparse.Namespace) -> Optional[int]:
 
 
 def _parse_action(raw: str, max_score: float) -> AegisAction:
-    data = json.loads(raw)
+    decoder = json.JSONDecoder()
+    cleaned = _strip_markdown_json_fence(raw).strip()
+    data = None
+    first_err: Optional[Exception] = None
+
+    # Tolerate reasoning/thinking prefixes by scanning for the first JSON object.
+    for i, ch in enumerate(cleaned):
+        if ch != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(cleaned[i:])
+            if isinstance(candidate, dict):
+                data = candidate
+                break
+        except Exception as e:
+            if first_err is None:
+                first_err = e
+
+    if data is None:
+        if first_err is not None:
+            raise first_err
+        raise ValueError("No JSON object found in model output")
+
     return AegisAction(
         final_score=float(data["final_score"]),
         score_justification=str(data.get("score_justification", "")),
@@ -232,10 +254,85 @@ def _complete_grading(
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
     }
+    fallback_kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+    }
     if max_tokens > 0:
         kwargs["max_tokens"] = max_tokens
-    completion = llm.chat.completions.create(**kwargs)
-    return (completion.choices[0].message.content or "").strip()
+        fallback_kwargs["max_completion_tokens"] = max_tokens
+
+    # Some OpenAI-compatible providers only accept one token-limit field.
+    try:
+        completion = llm.chat.completions.create(**kwargs)
+    except Exception as first_exc:
+        try:
+            completion = llm.chat.completions.create(**fallback_kwargs)
+        except Exception:
+            raise RuntimeError(f"llm_call_failed: {type(first_exc).__name__}: {first_exc!s}") from first_exc
+
+    if not completion.choices:
+        raise RuntimeError("llm_call_failed: empty choices")
+    msg = completion.choices[0].message
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        # Some providers/modes return structured content parts.
+        text_parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                t = part.get("text")
+                if isinstance(t, str):
+                    text_parts.append(t)
+            else:
+                t = getattr(part, "text", None)
+                if isinstance(t, str):
+                    text_parts.append(t)
+        return "\n".join(text_parts).strip()
+    return ""
+
+
+def _repair_prompt_from_invalid_output(raw: str, max_score: float) -> str:
+    clipped = raw[:2000]
+    return (
+        "Your previous response was not valid JSON.\n"
+        "Return ONLY a valid JSON object (no markdown, no extra text) with exactly these keys:\n"
+        '{\n'
+        f'  "final_score": <number between 0 and {max_score}>,\n'
+        '  "score_justification": "<string>",\n'
+        '  "improvement_advice": "<string>"\n'
+        "}\n\n"
+        "Invalid response to fix:\n"
+        f"{clipped}"
+    )
+
+
+def _get_action_with_retry(
+    llm: OpenAI,
+    model: str,
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    max_score: float,
+) -> Tuple[AegisAction, str]:
+    text = _strip_markdown_json_fence(
+        _complete_grading(llm, model, prompt, temperature, max_tokens)
+    )
+    try:
+        return _parse_action(text, max_score), text
+    except Exception as first_exc:
+        repair_prompt = _repair_prompt_from_invalid_output(text, max_score)
+        repaired = _strip_markdown_json_fence(
+            _complete_grading(llm, model, repair_prompt, 0.0, max_tokens)
+        )
+        try:
+            return _parse_action(repaired, max_score), repaired
+        except Exception as second_exc:
+            raise ValueError(
+                f"parse_error_after_retry: first={first_exc!s}; second={second_exc!s}"
+            ) from second_exc
 
 
 def _strip_markdown_json_fence(text: str) -> str:
@@ -254,6 +351,7 @@ def run_local_episode(
     temperature: float,
     max_tokens: int,
     episode_seed: Optional[int],
+    success_score_threshold: float,
 ) -> Tuple[bool, int, List[float]]:
     """In-process environment (sync)."""
     from server.aegis_env_environment import AegisEnvironment
@@ -275,18 +373,25 @@ def run_local_episode(
             obs = env.reset(seed=episode_seed, task_name=task_name)
 
             prompt = build_user_prompt(step, last_action, last_reward, history, obs)
-            text = _strip_markdown_json_fence(
-                _complete_grading(llm, model, prompt, temperature, max_tokens)
-            )
-
+            text = ""
             try:
-                action = _parse_action(text, obs.max_score)
+                action, text = _get_action_with_retry(
+                    llm,
+                    model,
+                    prompt,
+                    temperature,
+                    max_tokens,
+                    obs.max_score,
+                )
             except Exception as e:
                 err = f"parse_error: {e!s}"
                 steps_taken = step
                 rewards.append(0.0)
                 log_step(step, repr(text[:300]), 0.0, True, _error_column(err, None))
-                return False, steps_taken, rewards
+                history.append(f"step={step} parse_error={_one_line(str(e))}")
+                last_action = None
+                last_reward = 0.0
+                continue
 
             out = env.step(action)
             r = float(getattr(out, "reward", None) or 0.0)
@@ -304,7 +409,7 @@ def run_local_episode(
             )
             obs = out
             # Do not break on done; we may reset and continue for additional attempts.
-            if _episode_score(rewards) >= SUCCESS_SCORE_THRESHOLD:
+            if _episode_score(rewards) >= success_score_threshold:
                 break
 
         return True, steps_taken, rewards
@@ -313,7 +418,6 @@ def run_local_episode(
         steps_taken = max(steps_taken, 1)
         rewards.append(0.0)
         log_step(steps_taken, "<none>", 0.0, True, _error_column(err, None))
-        traceback.print_exc()
         return False, steps_taken, rewards
     finally:
         env.close()
@@ -330,6 +434,7 @@ async def run_remote_episode_async(
     temperature: float,
     max_tokens: int,
     episode_seed: Optional[int],
+    success_score_threshold: float,
 ) -> Tuple[bool, int, List[float]]:
     """WebSocket client: Docker image or HTTP base URL."""
     from client import AegisEnv
@@ -361,18 +466,25 @@ async def run_remote_episode_async(
 
             obs = result.observation
             prompt = build_user_prompt(step, last_action, last_reward, history, obs)
-            text = _strip_markdown_json_fence(
-                _complete_grading(llm, model, prompt, temperature, max_tokens)
-            )
-
+            text = ""
             try:
-                action = _parse_action(text, obs.max_score)
+                action, text = _get_action_with_retry(
+                    llm,
+                    model,
+                    prompt,
+                    temperature,
+                    max_tokens,
+                    obs.max_score,
+                )
             except Exception as e:
                 err = f"parse_error: {e!s}"
                 steps_taken = step
                 rewards.append(0.0)
                 log_step(step, repr(text[:300]), 0.0, True, _error_column(err, None))
-                return False, steps_taken, rewards
+                history.append(f"step={step} parse_error={_one_line(str(e))}")
+                last_action = None
+                last_reward = 0.0
+                continue
 
             result = await env.step(action)
             r = float(result.reward or 0.0)
@@ -389,21 +501,24 @@ async def run_remote_episode_async(
                 _error_column(None, result),
             )
             # Do not break on done; we may reset and continue for additional attempts.
-            if _episode_score(rewards) >= SUCCESS_SCORE_THRESHOLD:
+            if _episode_score(rewards) >= success_score_threshold:
                 break
 
         return True, steps_taken, rewards
     except Exception as e:
+        # If we already met target score, treat late transport failures as non-fatal.
+        if rewards and _episode_score(rewards) >= success_score_threshold:
+            return True, max(steps_taken, 1), rewards
         err = f"{type(e).__name__}: {e!s}"
         steps_taken = max(steps_taken, 1)
         if not rewards:
             rewards.append(0.0)
         log_step(steps_taken, "<none>", 0.0, True, _error_column(err, None))
-        traceback.print_exc()
         return False, steps_taken, rewards
     finally:
         if env is not None:
-            await env.close()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await env.close()
 
 
 async def run_episode_async(
@@ -423,6 +538,7 @@ async def run_episode_async(
             args.temperature,
             args.max_tokens,
             _episode_seed(args),
+            float(args.success_score_threshold),
         )
     return await run_remote_episode_async(
         args.task_name,
@@ -435,6 +551,7 @@ async def run_episode_async(
         args.temperature,
         args.max_tokens,
         _episode_seed(args),
+        float(args.success_score_threshold),
     )
 
 async def main_async(argv: Optional[List[str]] = None) -> int:
@@ -488,8 +605,11 @@ async def main_async(argv: Optional[List[str]] = None) -> int:
         exit_code = 0 if success else 1
     except SystemExit:
         raise
-    except Exception:
-        traceback.print_exc()
+    except KeyboardInterrupt:
+        success = _episode_score(rewards_out) >= float(args.success_score_threshold)
+        exit_code = 130
+    except Exception as e:
+        print(f"fatal_error={type(e).__name__}: {e!s}", file=sys.stderr)
         success = False
         exit_code = 1
     finally:
@@ -504,4 +624,7 @@ async def main_async(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main_async()))
+    try:
+        raise SystemExit(asyncio.run(main_async()))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
