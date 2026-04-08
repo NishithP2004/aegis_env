@@ -79,9 +79,21 @@ def _done_str(done: bool) -> str:
 
 def _episode_score(rewards: List[float]) -> float:
     if not rewards:
-        return 0.0
+        # Must be strictly between 0 and 1, even after formatting to 2 decimals.
+        return 0.01
     s = sum(rewards) / len(rewards)
-    return min(1.0, max(0.0, s))
+    s = min(1.0, max(0.0, s))
+    # Clamp to an exclusive range so we never emit 0.00 or 1.00 in logs.
+    if s <= 0.0:
+        return 0.01
+    if s >= 1.0:
+        return 0.99
+    # Avoid rounding to 0.00 / 1.00 when printed with 2 decimals.
+    if s < 0.01:
+        return 0.01
+    if s > 0.99:
+        return 0.99
+    return s
 
 
 def _one_line(s: str) -> str:
