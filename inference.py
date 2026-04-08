@@ -639,7 +639,4 @@ async def main_async(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(asyncio.run(main_async()))
-    except KeyboardInterrupt:
-        raise SystemExit(130)
+    asyncio.run(main_async())
