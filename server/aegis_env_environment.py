@@ -29,6 +29,22 @@ except ImportError:
     from models import AegisAction, AegisObservation
 
 
+def _coerce_aegis_action(action: Any) -> AegisAction:
+    """
+    Build this module's AegisAction.
+
+    Callers (e.g. inference.py) may construct AegisAction from another import path;
+    Pydantic v2 then treats that object as a different type than our AegisAction.
+    """
+    if isinstance(action, AegisAction):
+        return action
+    if isinstance(action, dict):
+        return AegisAction.model_validate(action)
+    if hasattr(action, "model_dump"):
+        return AegisAction.model_validate(action.model_dump())
+    return AegisAction.model_validate(action)
+
+
 def _rubrics_to_str(value: Any) -> str:
     if value is None:
         return ""
@@ -190,9 +206,9 @@ def _load_dataset_records() -> List[Dict[str, Any]]:
 
 class AegisEnvironment(Environment[AegisAction, AegisObservation, State]):
     """
-    Single-step grading episode: reset samples a row; step scores the agent output.
+    Multi-step grading episode: reset samples a row; step advances a 4-stage pipeline.
 
-    Reward is in [0, 1] from accuracy (max 0.7) plus feedback overlap (max 0.3).
+    Stages: arbiter -> scrutinizer -> validator -> mentor -> finished
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -209,6 +225,13 @@ class AegisEnvironment(Environment[AegisAction, AegisObservation, State]):
         self.current_ground_truth: Optional[float] = None
         self.current_reference_feedback: str = ""
         self.current_max_score: float = 1.0
+
+        # Multi-step pipeline state (initialized in reset()).
+        self.max_iterations: int = 2
+        self.refinement_loops_taken: int = 0
+        self.current_stage: str = "arbiter"
+        self.pipeline_history: str = ""
+        self.flow_bank: float = 0.10
 
         try:
             self.dataset = _load_dataset_records()
@@ -267,66 +290,136 @@ class AegisEnvironment(Environment[AegisAction, AegisObservation, State]):
         if not rubric_text or str(rubric_text).lower() == "nan":
             rubric_text = "Holistic grading: Evaluate the answer based on general scientific/linguistic accuracy."
 
+        # Initialize multi-step state machine
+        self.max_iterations = 2
+        self.refinement_loops_taken = 0
+        self.current_stage = "arbiter"
+        self.pipeline_history = "--- PIPELINE INITIATED ---\n"
+        self.flow_bank = 0.10
+
         # Return the Pydantic Observation model
         return AegisObservation(
             question=selected_record.get("question", "") or "",
             rubric=_rubrics_to_str(rubric_text),
             max_score=self.current_max_score,
             student_answer=selected_record.get("student_response", "") or "",
+            current_stage=self.current_stage,
+            refinement_loops_taken=self.refinement_loops_taken,
+            pipeline_history=self.pipeline_history,
             done=False,
-            reward=None,
+            reward=0.0,
             grading_info={},
+            metadata={},
         )
 
     def step(
         self,
-        action: AegisAction,
+        action: Any,
         timeout_s: Optional[float] = None,
         **kwargs: Any,
     ) -> AegisObservation:
         if self._current_record is None:
             raise RuntimeError("Environment must be reset before step().")
 
+        action = _coerce_aegis_action(action)
+
         self._state.step_count += 1
 
-        max_score = float(self._current_record.get("max_score") or 0.0)
-        obtained = float(self.current_ground_truth if self.current_ground_truth is not None else 0.0)
+        # 1) Log the agent's work into the pipeline history
+        self.pipeline_history += (
+            f"\n[{self.current_stage.upper()}]: "
+            f"Score: {action.proposed_score} | Routing: {action.routing_decision}\n"
+            f"Reasoning: {action.agent_reasoning}\n"
+        )
 
-        accuracy_reward = 0.0
-        if max_score > 0.0:
-            norm_human = obtained / max_score
-            norm_agent = action.final_score / max_score
-            if action.final_score < 0.0 or action.final_score > max_score:
-                accuracy_reward = 0.0
+        done = False
+        reward = 0.0
+        info: Dict[str, Any] = {}
+
+        # 2) State machine routing + reward computation
+        if self.current_stage == "arbiter":
+            self.current_stage = "scrutinizer"
+            reward = 0.02
+            self.flow_bank -= reward
+
+        elif self.current_stage == "scrutinizer":
+            self.current_stage = "validator"
+            reward = 0.02
+            self.flow_bank -= reward
+
+        elif self.current_stage == "validator":
+            decision = str(action.routing_decision or "").strip().lower()
+            if decision == "revise":
+                self.refinement_loops_taken += 1
+                if self.refinement_loops_taken > self.max_iterations:
+                    done = True
+                    reward = 0.0
+                    self.pipeline_history += "\n[SYSTEM]: FATAL ERROR - Max Refinement Iterations Exceeded."
+                else:
+                    self.current_stage = "scrutinizer"
+                    reward = 0.01
+                    self.flow_bank -= reward
+            elif decision == "proceed":
+                self.current_stage = "mentor"
+                reward = 0.02
+                self.flow_bank -= reward
             else:
-                accuracy_reward = 0.7 * (1.0 - abs(norm_agent - norm_human))
+                done = True
+                reward = 0.0
+                self.pipeline_history += f"\n[SYSTEM]: FATAL ERROR - Invalid routing_decision '{decision}'."
+
+        elif self.current_stage == "mentor":
+            done = True
+            max_score = float(self.current_max_score or 0.0)
+            obtained = float(self.current_ground_truth if self.current_ground_truth is not None else 0.0)
+            norm_human = obtained / max_score if max_score > 0 else 0.0
+            norm_agent = action.proposed_score / max_score if max_score > 0 else 0.0
+
+            # Accuracy reward (max 0.6)
+            acc_reward = 0.0
+            if max_score > 0 and 0.0 <= float(action.proposed_score) <= max_score:
+                acc_reward = 0.6 * (1.0 - abs(norm_agent - norm_human))
+
+            # Validity reward (max 0.3)
+            feed_reward = 0.0
+            if len(str(action.agent_reasoning or "").split()) >= 10:
+                feed_reward = 0.3 * _jaccard(str(action.agent_reasoning or ""), self.current_reference_feedback)
+
+            # Final Payout = Accuracy + Validity + Remaining Flow Bank
+            reward = acc_reward + feed_reward + self.flow_bank
+            reward = max(0.0, min(1.0, reward))
+
+            info = {
+                "accuracy_reward": acc_reward,
+                "validity_reward": feed_reward,
+                "flow_bank_payout": float(self.flow_bank),
+                "total_step_reward": reward,
+            }
         else:
-            accuracy_reward = 0.0
+            # Unknown stage: terminate safely.
+            done = True
+            reward = 0.0
+            self.pipeline_history += "\n[SYSTEM]: ERROR - Unknown stage."
 
-        agent_text = f"{action.score_justification} {action.improvement_advice}".strip()
-        word_count = len(agent_text.split())
-        feedback_reward = 0.0
-        if word_count >= 10:
-            feedback_reward = 0.3 * _jaccard(agent_text, self.current_reference_feedback)
+        # 3) Record reward history in the pipeline log (including intermediate 0.0).
+        self.pipeline_history += (
+            f"[SYSTEM]: reward={reward:.4f} done={str(done).lower()} next_stage="
+            f"{self.current_stage if not done else 'finished'}\n"
+        )
 
-        total = accuracy_reward + feedback_reward
-        total = max(0.0, min(1.0, total))
-
-        info: Dict[str, Any] = {
-            "accuracy_reward": accuracy_reward,
-            "feedback_reward": feedback_reward,
-            "total_reward": total,
-            "word_count": word_count,
-        }
-
+        rubric_text = _rubrics_to_str(self._current_record.get("rubrics"))
         return AegisObservation(
             question=str(self._current_record.get("question", "")),
-            rubric=_rubrics_to_str(self._current_record.get("rubrics")),
-            max_score=max_score,
+            rubric=rubric_text,
+            max_score=float(self.current_max_score or 1.0),
             student_answer=str(self._current_record.get("student_response", "")),
-            done=True,
-            reward=total,
+            current_stage=self.current_stage if not done else "finished",
+            refinement_loops_taken=self.refinement_loops_taken,
+            pipeline_history=self.pipeline_history,
+            done=done,
+            reward=reward,
             grading_info=info,
+            metadata={},
         )
 
     @property

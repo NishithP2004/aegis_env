@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AEGIS-Env: Automated Evaluation Pipeline</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ["Inter", "ui-sans-serif", "system-ui", "sans-serif"],
+            },
+            boxShadow: {
+              glow: "0 20px 60px rgba(99, 102, 241, 0.25)",
+            },
+          },
+        },
+      };
+    </script>
+
+    <style>
+      .glass {
+        background: rgba(255, 255, 255, 0.72);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border: 1px solid rgba(255, 255, 255, 0.6);
+      }
+      .soft-grid {
+        background-image: radial-gradient(
+            rgba(99, 102, 241, 0.12) 1px,
+            transparent 1px
+          ),
+          radial-gradient(rgba(236, 72, 153, 0.08) 1px, transparent 1px);
+        background-position: 0 0, 12px 12px;
+        background-size: 24px 24px;
+      }
+      .pretty-scroll::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+      .pretty-scroll::-webkit-scrollbar-thumb {
+        background: rgba(99, 102, 241, 0.25);
+        border-radius: 999px;
+      }
+      .pretty-scroll::-webkit-scrollbar-track {
+        background: rgba(15, 23, 42, 0.04);
+        border-radius: 999px;
+      }
+    </style>
+  </head>
+
+  <body class="min-h-screen bg-slate-50 text-slate-900 soft-grid">
+    <div
+      class="pointer-events-none fixed inset-x-0 top-0 h-80 bg-gradient-to-b from-indigo-200/60 via-fuchsia-200/30 to-transparent"
+    ></div>
+
+    <div class="relative mx-auto max-w-7xl px-4 pb-10 pt-8 sm:px-6 lg:px-8">
+      <!-- Header -->
+      <header class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <p class="text-sm font-medium text-slate-600">Human-in-the-loop tester</p>
+          <h1
+            class="mt-2 text-3xl font-semibold tracking-tight sm:text-4xl"
+          >
+            <span
+              class="text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 via-fuchsia-600 to-sky-600"
+            >
+              AEGIS-Env: Automated Evaluation Pipeline
+            </span>
+          </h1>
+          <p class="mt-2 max-w-2xl text-sm leading-6 text-slate-600">
+            Play the role of the RL agent: step through <span class="font-semibold">arbiter → scrutinizer → validator → mentor</span>,
+            inspect observation state, and submit actions.
+          </p>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2">
+          <a
+            href="/web/benchmark"
+            class="glass inline-flex items-center gap-2 rounded-2xl px-3 py-2 text-xs font-semibold text-indigo-800 shadow-sm ring-1 ring-indigo-200/60 transition hover:bg-white/90"
+          >
+            Benchmark
+          </a>
+          <span id="badge-episode" class="glass inline-flex items-center gap-2 rounded-2xl px-3 py-2 text-xs font-medium text-slate-700 shadow-sm">
+            <span class="h-2 w-2 rounded-full bg-slate-400"></span>
+            episode <span class="font-mono" id="episode-id">—</span>
+          </span>
+          <span id="badge-step" class="glass inline-flex items-center gap-2 rounded-2xl px-3 py-2 text-xs font-medium text-slate-700 shadow-sm">
+            <span class="h-2 w-2 rounded-full bg-slate-400"></span>
+            step <span class="font-mono" id="step-count">—</span>
+          </span>
+          <span id="badge-stage" class="glass inline-flex items-center gap-2 rounded-2xl px-3 py-2 text-xs font-medium text-slate-700 shadow-sm">
+            <span class="h-2 w-2 rounded-full bg-slate-400"></span>
+            stage <span class="font-mono" id="stage-name">—</span>
+          </span>
+        </div>
+      </header>
+
+      <!-- Error banner -->
+      <div id="error-banner" class="mt-6 hidden">
+        <div class="glass rounded-3xl border border-rose-200 bg-rose-50/70 px-4 py-3 text-sm text-rose-800 shadow-sm">
+          <div class="flex items-start justify-between gap-3">
+            <div>
+              <div class="font-semibold">Something went wrong</div>
+              <pre id="error-text" class="mt-1 whitespace-pre-wrap text-xs leading-5"></pre>
+            </div>
+            <button id="error-dismiss" class="rounded-xl px-2 py-1 text-xs font-semibold text-rose-700 hover:bg-rose-100">
+              Dismiss
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Task, auto-run, rewards chart -->
+      <section class="mt-8 glass rounded-3xl p-5 shadow-sm">
+        <div class="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <h2 class="text-sm font-semibold text-slate-800">Task &amp; auto-run</h2>
+            <p class="mt-1 text-xs leading-5 text-slate-600">
+              Choose difficulty (or run all three). Auto-run calls the same LLM loop as
+              <span class="font-mono">inference.py</span> via
+              <span class="font-mono">/api/llm/complete</span> (uses server env:
+              <span class="font-mono">HF_TOKEN</span> / <span class="font-mono">API_KEY</span>,
+              <span class="font-mono">API_BASE_URL</span>,
+              <span class="font-mono">MODEL_NAME</span>).
+            </p>
+          </div>
+          <div class="flex flex-wrap items-end gap-3">
+            <div>
+              <label class="text-xs font-semibold text-slate-700">Task</label>
+              <select
+                id="task-select"
+                class="mt-1 block w-full min-w-[10rem] rounded-2xl border border-slate-200 bg-white/80 px-3 py-2.5 text-sm shadow-sm outline-none focus:border-indigo-300 focus:ring-4 focus:ring-indigo-200/60"
+              >
+                <option value="all" selected>All (easy → medium → hard)</option>
+                <option value="easy">Easy</option>
+                <option value="medium">Medium</option>
+                <option value="hard">Hard</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-xs font-semibold text-slate-700">Max steps / episode</label>
+              <input
+                id="max-steps"
+                type="number"
+                min="1"
+                max="500"
+                value="10"
+                class="mt-1 w-28 rounded-2xl border border-slate-200 bg-white/80 px-3 py-2.5 text-sm shadow-sm outline-none focus:border-indigo-300 focus:ring-4 focus:ring-indigo-200/60"
+              />
+            </div>
+            <button
+              id="btn-auto-run"
+              type="button"
+              class="inline-flex items-center justify-center gap-2 rounded-2xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800 disabled:opacity-50"
+            >
+              <span class="h-2 w-2 rounded-full bg-emerald-400"></span>
+              Start auto-run
+            </button>
+            <button
+              id="btn-auto-stop"
+              type="button"
+              disabled
+              class="inline-flex items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white/70 px-4 py-2.5 text-sm font-semibold text-slate-800 shadow-sm transition hover:bg-white disabled:opacity-50"
+            >
+              Stop
+            </button>
+          </div>
+        </div>
+
+        <details class="mt-5 rounded-2xl border border-slate-200/80 bg-white/50 px-4 py-3 text-xs leading-5 text-slate-700 open:shadow-sm">
+          <summary class="cursor-pointer select-none text-sm font-semibold text-slate-800">
+            Reward function (how step rewards are computed)
+          </summary>
+          <div class="mt-3 space-y-3 border-t border-slate-200/80 pt-3">
+            <p>
+              Rewards are <span class="font-semibold">dense</span> along the pipeline, then a
+              <span class="font-semibold">final payout</span> on the last step. Each episode starts with a
+              <span class="font-mono">flow_bank</span> of <span class="font-mono">0.10</span>. Intermediate
+              transitions subtract small amounts from the bank as “progress” rewards.
+            </p>
+            <div>
+              <div class="font-semibold text-slate-800">Pipeline transitions</div>
+              <ul class="mt-1 list-disc space-y-1 pl-5">
+                <li>
+                  <span class="font-mono">arbiter → scrutinizer</span>,
+                  <span class="font-mono">scrutinizer → validator</span>: reward
+                  <span class="font-mono">0.02</span> each (bank decreases).
+                </li>
+                <li>
+                  <span class="font-mono">validator</span> with
+                  <span class="font-mono">routing_decision = proceed → mentor</span>: reward
+                  <span class="font-mono">0.02</span>.
+                </li>
+                <li>
+                  <span class="font-mono">validator</span> with
+                  <span class="font-mono">revise → scrutinizer</span> (refinement loop): reward
+                  <span class="font-mono">0.01</span>. At most two refinement loops; exceeding that or an
+                  invalid route ends the episode with a fatal step (reward <span class="font-mono">0</span>).
+                </li>
+              </ul>
+            </div>
+            <div>
+              <div class="font-semibold text-slate-800">Final step (<span class="font-mono">mentor</span>)</div>
+              <p class="mt-1">
+                The episode completes at <span class="font-mono">mentor</span>. The step reward is the sum of:
+              </p>
+              <ul class="mt-1 list-disc space-y-1 pl-5">
+                <li>
+                  <span class="font-semibold">Accuracy</span> (up to <span class="font-mono">0.6</span>): compare
+                  normalized proposed score vs. hidden human score:
+                  <span class="font-mono">0.6 × (1 − |norm_agent − norm_human|)</span> when
+                  <span class="font-mono">proposed_score ∈ [0, max_score]</span>.
+                </li>
+                <li>
+                  <span class="font-semibold">Validity</span> (up to <span class="font-mono">0.3</span>): if
+                  <span class="font-mono">agent_reasoning</span> has at least 10 words,
+                  <span class="font-mono">0.3 × Jaccard(reasoning, reference_feedback)</span>.
+                </li>
+                <li>
+                  <span class="font-semibold">Flow bank remainder</span>: whatever is left in
+                  <span class="font-mono">flow_bank</span> is paid out with the final step.
+                </li>
+              </ul>
+              <p class="mt-1 text-slate-600">
+                The total is clamped to <span class="font-mono">[0, 1]</span>. When the episode ends, diagnostics
+                include <span class="font-mono">accuracy_reward</span>,
+                <span class="font-mono">validity_reward</span>,
+                <span class="font-mono">flow_bank_payout</span>, and
+                <span class="font-mono">total_step_reward</span>.
+              </p>
+            </div>
+          </div>
+        </details>
+
+        <p id="auto-status" class="mt-3 text-xs font-medium text-indigo-700"></p>
+        <div class="mt-4 h-64 w-full">
+          <canvas id="reward-chart" aria-label="Step rewards"></canvas>
+        </div>
+      </section>
+
+      <!-- Main grid -->
+      <main class="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <!-- Left: Observation -->
+        <section class="space-y-6">
+          <div class="glass rounded-3xl p-5 shadow-sm">
+            <div class="flex items-center justify-between gap-3">
+              <h2 class="text-sm font-semibold text-slate-800">Task context</h2>
+              <span class="rounded-2xl bg-slate-900/5 px-3 py-1 text-xs font-medium text-slate-700">
+                max_score <span class="font-mono" id="max-score">—</span>
+              </span>
+            </div>
+            <div class="mt-4 grid gap-4">
+              <div>
+                <div class="text-xs font-semibold uppercase tracking-wide text-slate-500">Question</div>
+                <div id="obs-question" class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-800">—</div>
+              </div>
+              <div>
+                <div class="text-xs font-semibold uppercase tracking-wide text-slate-500">Rubric</div>
+                <div id="obs-rubric" class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-800">—</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="glass rounded-3xl p-5 shadow-sm">
+            <h2 class="text-sm font-semibold text-slate-800">Student submission</h2>
+            <div id="obs-student" class="mt-3 whitespace-pre-wrap text-sm leading-6 text-slate-800">—</div>
+          </div>
+
+          <div class="glass rounded-3xl p-5 shadow-sm">
+            <div class="flex items-center justify-between gap-3">
+              <h2 class="text-sm font-semibold text-slate-800">Pipeline history</h2>
+              <span class="rounded-2xl bg-indigo-500/10 px-3 py-1 text-xs font-medium text-indigo-700">
+                live transcript
+              </span>
+            </div>
+            <pre
+              id="obs-history"
+              class="pretty-scroll mt-4 max-h-[360px] overflow-auto whitespace-pre-wrap rounded-2xl bg-slate-900 px-4 py-3 text-xs leading-5 text-slate-100 shadow-inner"
+            >—</pre>
+          </div>
+
+          <div id="diagnostics-card" class="glass hidden rounded-3xl p-5 shadow-sm">
+            <div class="flex items-center justify-between gap-3">
+              <h2 class="text-sm font-semibold text-slate-800">Grading diagnostics</h2>
+              <span class="rounded-2xl bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-700">
+                episode complete
+              </span>
+            </div>
+            <div id="diag-grid" class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <!-- populated dynamically -->
+            </div>
+          </div>
+        </section>
+
+        <!-- Right: Action -->
+        <section class="space-y-6">
+          <div class="glass rounded-3xl p-5 shadow-sm">
+            <h2 class="text-sm font-semibold text-slate-800">Action</h2>
+            <p class="mt-1 text-xs leading-5 text-slate-600">
+              Submit an action matching the environment schema. Routing decision matters only in the
+              <span class="font-semibold">validator</span> stage.
+            </p>
+
+            <form id="action-form" class="mt-5 space-y-4">
+              <div>
+                <label class="text-xs font-semibold text-slate-700">Proposed score</label>
+                <div class="mt-2 flex items-center gap-3">
+                  <input
+                    id="inp-score"
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    class="w-full rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm shadow-sm outline-none transition focus:border-indigo-300 focus:ring-4 focus:ring-indigo-200/60"
+                    placeholder="e.g. 4.5"
+                  />
+                  <button
+                    id="btn-score-max"
+                    type="button"
+                    class="rounded-2xl bg-slate-900/5 px-3 py-3 text-xs font-semibold text-slate-700 hover:bg-slate-900/10"
+                    title="Set score to max_score"
+                  >
+                    Max
+                  </button>
+                </div>
+                <div class="mt-2 text-xs text-slate-500">
+                  Range: 0 → <span class="font-mono" id="max-score-inline">—</span>
+                </div>
+              </div>
+
+              <div>
+                <label class="text-xs font-semibold text-slate-700">Agent reasoning</label>
+                <textarea
+                  id="inp-reason"
+                  rows="10"
+                  class="mt-2 w-full resize-none rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm leading-6 shadow-sm outline-none transition focus:border-fuchsia-300 focus:ring-4 focus:ring-fuchsia-200/60"
+                  placeholder="Write your analysis, critique, or feedback for this stage…"
+                ></textarea>
+              </div>
+
+              <div>
+                <label class="text-xs font-semibold text-slate-700">Routing decision</label>
+                <div class="mt-2 grid grid-cols-2 gap-2">
+                  <button
+                    id="route-proceed"
+                    type="button"
+                    class="route-btn rounded-2xl border border-slate-200 bg-white/70 px-4 py-3 text-sm font-semibold text-slate-800 shadow-sm transition hover:bg-white"
+                    data-value="proceed"
+                  >
+                    Proceed
+                  </button>
+                  <button
+                    id="route-revise"
+                    type="button"
+                    class="route-btn rounded-2xl border border-slate-200 bg-white/70 px-4 py-3 text-sm font-semibold text-slate-800 shadow-sm transition hover:bg-white"
+                    data-value="revise"
+                  >
+                    Revise
+                  </button>
+                </div>
+                <div class="mt-2 text-xs text-slate-500">
+                  Selected: <span class="font-mono" id="route-selected">proceed</span>
+                </div>
+              </div>
+            </form>
+          </div>
+
+          <!-- Control bar -->
+          <div class="glass sticky bottom-4 rounded-3xl p-4 shadow-glow">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div class="text-xs text-slate-600">
+                <div class="font-semibold text-slate-800">Controls</div>
+                <div class="mt-0.5">Reset starts a new episode. Step submits your action.</div>
+              </div>
+              <div class="flex gap-2">
+                <button
+                  id="btn-reset"
+                  class="inline-flex items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white/70 px-4 py-3 text-sm font-semibold text-slate-800 shadow-sm transition hover:bg-white disabled:opacity-60"
+                >
+                  <span class="h-2.5 w-2.5 rounded-full bg-slate-400"></span>
+                  Reset
+                </button>
+                <button
+                  id="btn-step"
+                  class="inline-flex items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-600 via-fuchsia-600 to-sky-600 px-5 py-3 text-sm font-semibold text-white shadow-glow transition hover:brightness-110 disabled:opacity-60"
+                >
+                  <span id="step-spinner" class="hidden h-4 w-4 animate-spin rounded-full border-2 border-white/50 border-t-white"></span>
+                  <span id="step-label">Take Step</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="mt-10 text-center text-xs text-slate-500">
+        <span class="font-mono">/openenv</span> hosts the default OpenEnv UI/API. This custom UI lives at
+        <span class="font-mono">/web</span>.
+      </footer>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="/web/assets/app.js"></script>
+  </body>
+</html>
+

@@ -78,17 +78,18 @@ def _done_str(done: bool) -> str:
 
 
 def _episode_score(rewards: List[float]) -> float:
+    # In the multi-step pipeline with dense rewards, sum the rewards to get the total episode score.
     if not rewards:
-        # Must be strictly between 0 and 1, even after formatting to 2 decimals.
         return 0.01
-    s = sum(rewards) / len(rewards)
+
+    s = sum(rewards)
     s = min(1.0, max(0.0, s))
-    # Clamp to an exclusive range so we never emit 0.00 or 1.00 in logs.
+
+    # Clamp to an exclusive range so we never emit exactly 0.00 or 1.00 in logs.
     if s <= 0.0:
         return 0.01
     if s >= 1.0:
         return 0.99
-    # Avoid rounding to 0.00 / 1.00 when printed with 2 decimals.
     if s < 0.01:
         return 0.01
     if s > 0.99:
@@ -126,9 +127,9 @@ def _fallback_action_json() -> str:
     # Minimal valid action JSON that will always parse.
     return json.dumps(
         {
-            "final_score": 0.0,
-            "score_justification": "",
-            "improvement_advice": "",
+            "proposed_score": 0.0,
+            "agent_reasoning": "",
+            "routing_decision": "proceed",
         },
         ensure_ascii=False,
     )
@@ -161,35 +162,6 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     )
 
 
-def generate_grading_prompt(obs: AegisObservation) -> str:
-    return f"""You are an expert Automated Grading Agent. Your goal is to evaluate a student's answer by combining the rigor of a strict evaluator with the constructive guidance of a mentor.
-
-Follow this internal evaluation process:
-1. Scrutinize: Conduct a detailed, criterion-by-criterion verification of the student's answer against the rubric.
-2. Validate: Ensure your evaluation is fair, unbiased, and strictly adheres to the scoring limits.
-3. Mentor: Translate your technical findings into clear, personalized, and actionable feedback that fosters a growth mindset.
-
-You must output ONLY a raw JSON object. Do not wrap it in markdown formatting (e.g., no ```json). The JSON must have exactly these keys:
-{{
-  "final_score": <number strictly between 0 and {obs.max_score} inclusive>,
-  "score_justification": "<string: detailed reasoning for the score based on the rubric>",
-  "improvement_advice": "<string: specific, actionable recommendations for the student>"
-}}
-
---- DATA ---
-Question:
-{obs.question}
-
-Rubric:
-{obs.rubric}
-
-Maximum Score: {obs.max_score}
-
-Student Answer:
-{obs.student_answer}
-"""
-
-
 def build_user_prompt(
     step: int,
     last_action: Optional[str],
@@ -197,17 +169,89 @@ def build_user_prompt(
     history: List[str],
     obs: AegisObservation,
 ) -> str:
-    # Keep everything single-line friendly; the LLM can still read newlines,
-    # but we avoid embedding uncontrolled exceptions/newlines in log fields.
-    hist = "\n".join(history[-6:]) if history else "None"
-    last_action_s = last_action if last_action is not None else "None"
-    return (
-        f"Step: {step}\n"
-        f"Last action: {last_action_s}\n"
-        f"Last reward: {last_reward:.2f}\n"
-        f"Previous steps:\n{hist}\n\n"
-        f"{generate_grading_prompt(obs)}"
+    stage = str(getattr(obs, "current_stage", "") or "")
+    loops = int(getattr(obs, "refinement_loops_taken", 0) or 0)
+
+    PROMPT_TEMPLATE = """{persona}
+
+--- PIPELINE HISTORY ---
+{pipeline_history}
+
+--- DATA ---
+Question: {question}
+Rubric: {rubric}
+Student Answer: {student_answer}
+Maximum Score: {max_score}
+
+You must output ONLY a raw JSON object. Do not wrap it in markdown formatting (e.g., no ```json).
+{{
+  "proposed_score": <number strictly between 0 and {max_score} inclusive>,
+  "agent_reasoning": "<string: your detailed analysis, critique, or feedback for this stage>",
+  "routing_decision": "<string: 'proceed' or 'revise'>"
+}}"""
+
+    if stage == "arbiter":
+        persona = f"""You are **The Arbiter**, the initial routing/assessment agent in the automated grading pipeline.
+
+Goal: Perform the first comprehensive evaluation of the student's answer against the rubric.
+
+Instructions:
+- Conduct a thorough preliminary analysis against the rubric.
+- Propose an initial score and explain strengths + areas of concern.
+- Your reasoning will be used by later stages; be clear and complete.
+- Set routing_decision to 'proceed'."""
+    elif stage == "scrutinizer":
+        persona = f"""You are **The Scrutinizer**, the first refinement agent.
+
+Goal: Critically examine and improve the current assessment.
+
+Instructions:
+- Review the pipeline history for accuracy, completeness, and rubric alignment.
+- Do a criterion-by-criterion verification; fix gaps or inconsistencies.
+- Refine the score and provide tighter justification grounded in the student answer.
+- Set routing_decision to 'proceed'."""
+    elif stage == "validator":
+        persona = f"""You are **The Validator**, the quality assurance guardian of the evaluation process.
+
+Refinement loop: {loops}/2.
+
+Goal: Review the Scrutinizer's refined evaluation for fairness, accuracy, and consistency.
+
+Instructions:
+- Audit the pipeline history for fairness, accuracy, and consistency with the rubric.
+- Check for missing criteria, unjustified leaps, bias, or unclear feedback.
+- If deficiencies remain, set routing_decision to 'revise' (send back for another pass).
+- If the evaluation meets a high standard, set routing_decision to 'proceed'."""
+    elif stage == "mentor":
+        persona = f"""You are **The Mentor**, the final agent who turns the validated assessment into a helpful report.
+
+Goal: Produce clear, personalized, actionable feedback for the student.
+
+Instructions:
+- Synthesize the final score and reasoning from the pipeline history.
+- Write encouraging, specific feedback: celebrate strengths, identify growth areas.
+- Provide actionable next steps (concrete improvements / study suggestions).
+- Set routing_decision to 'proceed'."""
+    else:
+        persona = f"""You are an Automated Evaluation Agent.
+
+Goal: Return a reasonable score and clear reasoning.
+
+Instructions:
+- Follow the required JSON schema.
+- Set routing_decision to 'proceed'."""
+
+    return PROMPT_TEMPLATE.format(
+        persona=persona.strip(),
+        pipeline_history=str(getattr(obs, "pipeline_history", "") or ""),
+        question=str(getattr(obs, "question", "") or ""),
+        rubric=str(getattr(obs, "rubric", "") or ""),
+        student_answer=str(getattr(obs, "student_answer", "") or ""),
+        max_score=float(getattr(obs, "max_score", 1.0) or 1.0),
     )
+
+
+## NOTE: build_user_prompt is defined above (stage-aware).
 
 
 def _episode_seed(args: argparse.Namespace) -> Optional[int]:
@@ -244,18 +288,18 @@ def _parse_action(raw: str, max_score: float) -> AegisAction:
         raise ValueError("No JSON object found in model output")
 
     return AegisAction(
-        final_score=float(data["final_score"]),
-        score_justification=str(data.get("score_justification", "")),
-        improvement_advice=str(data.get("improvement_advice", "")),
+        proposed_score=float(data.get("proposed_score", 0.0)),
+        agent_reasoning=str(data.get("agent_reasoning", "")),
+        routing_decision=str(data.get("routing_decision", "proceed")),
     )
 
 
 def _action_log_str(action: AegisAction) -> str:
     return json.dumps(
         {
-            "final_score": action.final_score,
-            "score_justification": action.score_justification[:200],
-            "improvement_advice": action.improvement_advice[:200],
+            "proposed_score": action.proposed_score,
+            "routing": action.routing_decision,
+            "reasoning": (action.agent_reasoning or "")[:100] + "...",
         },
         ensure_ascii=False,
     )
@@ -390,12 +434,8 @@ def run_local_episode(
     env = AegisEnvironment()
     obs: AegisObservation
     try:
+        obs = env.reset(seed=episode_seed, task_name=task_name)
         for step in range(1, max_steps + 1):
-            # AEGIS-Env can be a single-step episode (done after one step).
-            # We keep running new episodes (reset -> step) until success threshold
-            # is met or max_steps is exhausted.
-            obs = env.reset(seed=episode_seed, task_name=task_name)
-
             prompt = build_user_prompt(step, last_action, last_reward, history, obs)
             text = ""
             try:
@@ -433,8 +473,7 @@ def run_local_episode(
                 _error_column(None, None),
             )
             obs = out
-            # Do not break on done; we may reset and continue for additional attempts.
-            if _episode_score(rewards) >= success_score_threshold:
+            if bool(getattr(out, "done", False)):
                 break
 
         return True, steps_taken, rewards
@@ -483,13 +522,9 @@ async def run_remote_episode_async(
             env = AegisEnv(base_url=openenv_base_url)
             await env.connect()
 
+        result = await env.reset(seed=episode_seed, task_name=task_name)
+        obs = result.observation
         for step in range(1, max_steps + 1):
-            # AEGIS-Env can be a single-step episode (done after one step).
-            # We keep running new episodes (reset -> step) until success threshold
-            # is met or max_steps is exhausted.
-            result = await env.reset(seed=episode_seed, task_name=task_name)
-
-            obs = result.observation
             prompt = build_user_prompt(step, last_action, last_reward, history, obs)
             text = ""
             try:
@@ -526,8 +561,8 @@ async def run_remote_episode_async(
                 result.done,
                 _error_column(None, result),
             )
-            # Do not break on done; we may reset and continue for additional attempts.
-            if _episode_score(rewards) >= success_score_threshold:
+            obs = result.observation
+            if result.done:
                 break
 
         return True, steps_taken, rewards
