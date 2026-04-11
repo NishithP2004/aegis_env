@@ -13,12 +13,12 @@ over HTTP and WebSocket endpoints, compatible with EnvClient.
 Endpoints:
     - Custom UI:  GET /web, GET /web/benchmark (served from server/web)
     - Benchmark: GET /api/benchmark/models, POST /api/benchmark/run
-    - OpenEnv API/UI (default): mounted under /openenv
-        - POST /openenv/reset
-        - POST /openenv/step
-        - GET  /openenv/state
-        - GET  /openenv/schema
-        - WS   /openenv/ws
+    - OpenEnv HTTP/WS API: same app mounted at / and /openenv (explicit routes win first)
+        - POST /reset, /openenv/reset
+        - POST /step, /openenv/step
+        - GET  /state, /openenv/state
+        - GET  /schema, /openenv/schema
+        - WS   /ws, /openenv/ws
 
 Usage:
     # Development (with auto-reload):
@@ -319,6 +319,10 @@ def llm_complete(req: LLMCompleteRequest) -> dict[str, Any]:
         text = ""
 
     return {"content": text, "model": model}
+
+
+# Stock OpenEnv paths (/reset, /state, /step, …) — registered after /, /web, /api/* so those win.
+app.mount("/", openenv_app)
 
 
 def main(host: str = "0.0.0.0", port: int = 8000):

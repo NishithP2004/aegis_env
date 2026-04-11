@@ -56,6 +56,32 @@
         background: rgba(15, 23, 42, 0.04);
         border-radius: 999px;
       }
+      /* Dense stops + wide tile so indigo → fuchsia → sky blends without visible bands */
+      .btn-step-gradient {
+        background-color: #4f46e5;
+        background-image: linear-gradient(
+          93deg,
+          #4338ca 0%,
+          #4537c9 6%,
+          #4f46e5 14%,
+          #5b4ae8 22%,
+          #6d28d9 30%,
+          #7c3aed 38%,
+          #9333ea 44%,
+          #a855f7 50%,
+          #c026d3 56%,
+          #b84fd8 60%,
+          #9d4edd 64%,
+          #7c3aed 70%,
+          #6366f1 76%,
+          #4f7df0 82%,
+          #3b82f6 88%,
+          #0ea5e9 94%,
+          #0284c7 100%
+        );
+        background-size: 210% 100%;
+        background-position: 0% 50%;
+      }
     </style>
   </head>
 
@@ -392,7 +418,7 @@
                 </button>
                 <button
                   id="btn-step"
-                  class="inline-flex items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-600 via-fuchsia-600 to-sky-600 px-5 py-3 text-sm font-semibold text-white shadow-glow transition hover:brightness-110 disabled:opacity-60"
+                  class="btn-step-gradient inline-flex items-center justify-center gap-2 rounded-2xl px-5 py-3 text-sm font-semibold text-white shadow-glow transition hover:brightness-110 disabled:opacity-60"
                 >
                   <span id="step-spinner" class="hidden h-4 w-4 animate-spin rounded-full border-2 border-white/50 border-t-white"></span>
                   <span id="step-label">Take Step</span>
