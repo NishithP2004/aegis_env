@@ -120,11 +120,9 @@ def _reference_feedback_from_record(rec: Dict[str, Any]) -> str:
     ev = rec.get("evaluation") or {}
     agent_feedback = (ev.get("agent_feedback") or {}) if isinstance(ev, dict) else {}
     if isinstance(agent_feedback, dict):
-        sj = agent_feedback.get("score_justification")
         ia = agent_feedback.get("improvement_advice")
-        joined = " ".join([str(x).strip() for x in [sj, ia] if x is not None]).strip()
-        if joined:
-            return joined
+        if ia is not None:
+            return str(ia).strip()
     # Backward-compat: old field name.
     return str(rec.get("reference_feedback") or "")
 
@@ -159,6 +157,54 @@ def _download_dataset_json(repo_id: str, filename: str, revision: Optional[str])
         return stable_path
     except Exception:
         return Path(downloaded)
+
+
+def _apply_train_test_split(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Apply train/test split with balanced sampling across unique questions per dataset.
+    Test split ratios: ricechem=10%, asap-sas=20%, mohler=30%.
+    Returns only the training subset.
+    """
+    SEED = 42
+    train_seed = random.Random(SEED)
+
+    splits = {
+        "ricechem": 0.10,
+        "asap-sas": 0.20,
+        "mohler": 0.30,
+    }
+
+    test_indices = set()
+
+    for dataset, ratio in splits.items():
+        # Filter records for this dataset
+        dataset_indices = [i for i, rec in enumerate(records) if rec.get("dataset") == dataset]
+        if not dataset_indices:
+            continue
+
+        # Group by question
+        question_groups: Dict[str, List[int]] = {}
+        for idx in dataset_indices:
+            question = records[idx].get("question", "")
+            if question not in question_groups:
+                question_groups[question] = []
+            question_groups[question].append(idx)
+
+        # Calculate how many samples per question
+        total_rows = len(dataset_indices)
+        test_size = int(total_rows * ratio)
+        num_questions = len(question_groups)
+        per_question = max(1, int(test_size / num_questions))
+
+        # Sample from each question to balance the test set
+        for question, indices in question_groups.items():
+            sample_size = min(per_question, len(indices))
+            sampled_indices = train_seed.sample(indices, k=sample_size)
+            test_indices.update(sampled_indices)
+
+    # Return only training records (excluding test indices)
+    train_records = [rec for i, rec in enumerate(records) if i not in test_indices]
+    return train_records
 
 
 def _load_dataset_records() -> List[Dict[str, Any]]:
@@ -201,7 +247,10 @@ def _load_dataset_records() -> List[Dict[str, Any]]:
         for k in ("max_score", "min_score", "obtained_score"):
             norm[k] = _unwrap_number(rec.get(k))
         out.append(norm)
-    return out
+
+    # Apply train/test split to return only training data
+    train_records = _apply_train_test_split(out)
+    return train_records
 
 
 class AegisEnvironment(Environment[AegisAction, AegisObservation, State]):
