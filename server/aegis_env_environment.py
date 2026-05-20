@@ -116,14 +116,17 @@ def _unwrap_number(v: Any) -> Optional[float]:
 
 
 def _reference_feedback_from_record(rec: Dict[str, Any]) -> str:
-    # New schema stores feedback under evaluation.agent_feedback.
+    feedback = rec.get("feedback")
+    if feedback is not None:
+        return str(feedback).strip()
+
+    # Backward-compat: older nested field names.
     ev = rec.get("evaluation") or {}
     agent_feedback = (ev.get("agent_feedback") or {}) if isinstance(ev, dict) else {}
     if isinstance(agent_feedback, dict):
         ia = agent_feedback.get("improvement_advice")
         if ia is not None:
             return str(ia).strip()
-    # Backward-compat: old field name.
     return str(rec.get("reference_feedback") or "")
 
 
@@ -210,8 +213,8 @@ def _apply_train_test_split(records: List[Dict[str, Any]]) -> List[Dict[str, Any
 def _load_dataset_records() -> List[Dict[str, Any]]:
     _load_dotenv_if_available()
 
-    repo_id = os.environ.get("AEGIS_HF_DATASET_REPO") or "NishithP2004/AEGIS-Eval-v2"
-    filename = os.environ.get("AEGIS_HF_DATASET_FILE") or "dataset.json"
+    repo_id = os.environ.get("AEGIS_HF_DATASET_REPO") or "NishithP2004/AEGIS"
+    filename = os.environ.get("AEGIS_HF_DATASET_FILE") or "train.json"
     revision = os.environ.get("AEGIS_HF_DATASET_REVISION") or None
     offline = str(os.environ.get("AEGIS_HF_OFFLINE") or "").lower() in {"1", "true", "yes"}
 
